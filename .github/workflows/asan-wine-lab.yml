@@ -1,0 +1,182 @@
+name: LLVM-MinGW ASan under Wine diagnostic
+
+on:
+  push:
+    branches:
+      - ci/asan-wine-lab-20260826
+
+permissions:
+  contents: read
+
+jobs:
+  prefix_ownership_control:
+    name: Reproduce bind-mount ownership failure
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:13-slim
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: 62593d38d21a2beb67583f047f9bb440f0b7056b
+
+    - name: Prove the original prefix location is rejected
+      run: |-
+        set -x
+        apt-get update
+        apt-get install --yes --no-install-recommends wine wine64
+
+        export WINEARCH=win64
+        export WINEDEBUG=-all
+        export WINEPREFIX="${GITHUB_WORKSPACE}/.wineprefix"
+        set +e
+        timeout 60s wineboot --init > /tmp/wineboot.log 2>&1
+        wineboot_exit_code=$?
+        set -e
+        cat /tmp/wineboot.log
+        test "${wineboot_exit_code}" -ne 0
+        grep -Fq 'is not owned by you' /tmp/wineboot.log
+
+  sanitizer:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: debian:13-slim
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x64 without preloader
+            triplet: x86_64-w64-mingw32
+            runtime_arch: x86_64-w64-mingw32
+            asan_dll: libclang_rt.asan_dynamic-x86_64.dll
+            wine_arch: win64
+            wine_package: wine64
+            preloader_package: ''
+            expectation: sanitizer
+          - name: x64 with preloader
+            triplet: x86_64-w64-mingw32
+            runtime_arch: x86_64-w64-mingw32
+            asan_dll: libclang_rt.asan_dynamic-x86_64.dll
+            wine_arch: win64
+            wine_package: wine64
+            preloader_package: wine64-preloader
+            expectation: sanitizer
+          - name: x86 without preloader (collision control)
+            triplet: i686-w64-mingw32
+            runtime_arch: i686-w64-mingw32
+            asan_dll: libclang_rt.asan_dynamic-i386.dll
+            wine_arch: win32
+            wine_package: wine32:i386
+            preloader_package: ''
+            expectation: shadow_collision
+          - name: x86 with preloader
+            triplet: i686-w64-mingw32
+            runtime_arch: i686-w64-mingw32
+            asan_dll: libclang_rt.asan_dynamic-i386.dll
+            wine_arch: win32
+            wine_package: wine32:i386
+            preloader_package: wine32-preloader:i386
+            expectation: sanitizer
+    env:
+      ASAN_OPTIONS: halt_on_error=1:abort_on_error=1:detect_leaks=0
+      LLVM_MINGW_SHA256: 534b92e067b22a6b4441f48ae9240a3341b17825d04d577eab0cf85c44b4deda
+      LLVM_MINGW_VERSION: '20260616'
+      WINEDEBUG: -all
+      WINEPREFIX: /tmp/wineprefix
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        ref: 62593d38d21a2beb67583f047f9bb440f0b7056b
+
+    - name: Install Wine
+      env:
+        WINE_PACKAGE: ${{ matrix.wine_package }}
+        PRELOADER_PACKAGE: ${{ matrix.preloader_package }}
+      run: |-
+        set -x
+        if [[ "${WINE_PACKAGE}" == *:i386 ]]; then
+          dpkg --add-architecture i386
+        fi
+        apt-get update
+        packages=(ca-certificates wget wine xz-utils "${WINE_PACKAGE}")
+        if [[ -n "${PRELOADER_PACKAGE}" ]]; then
+          packages+=("${PRELOADER_PACKAGE}")
+        fi
+        apt-get install --yes --no-install-recommends "${packages[@]}"
+        wine --version
+        dpkg-query --show 'wine*-preloader*' 2>/dev/null || true
+
+    - name: Install LLVM-MinGW
+      run: |-
+        llvm_mingw_dir="llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64"
+        llvm_mingw_tarball="${llvm_mingw_dir}.tar.xz"
+        llvm_mingw_url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/${llvm_mingw_tarball}"
+        set -x
+        wget --progress=dot:giga "${llvm_mingw_url}"
+        printf '%s  %s\n' "${LLVM_MINGW_SHA256}" "${llvm_mingw_tarball}" \
+            | sha256sum --check --strict
+        tar -xf "${llvm_mingw_tarball}"
+        echo "LLVM_MINGW_DIR=${GITHUB_WORKSPACE}/${llvm_mingw_dir}" >> "${GITHUB_ENV}"
+
+    - name: Build healthy and failing ASan controls
+      env:
+        TRIPLET: ${{ matrix.triplet }}
+        RUNTIME_ARCH: ${{ matrix.runtime_arch }}
+        ASAN_DLL: ${{ matrix.asan_dll }}
+      run: |-
+        compiler="${LLVM_MINGW_DIR}/bin/${TRIPLET}-gcc"
+        runtime_dir="${LLVM_MINGW_DIR}/${RUNTIME_ARCH}/bin"
+        mkdir -p controls
+        set -x
+        "${compiler}" -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+            expat/gennmtab/gennmtab.c -o controls/asan-ok.exe
+        "${compiler}" -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+            .github/workflows/scripts/asan-heap-overflow.c \
+            -o controls/asan-bad.exe
+        cp -v "${runtime_dir}/${ASAN_DLL}" controls/
+        cp -v "${runtime_dir}/libc++.dll" "${runtime_dir}/libunwind.dll" controls/
+
+    - name: Initialize Wine and exercise ASan
+      env:
+        EXPECTATION: ${{ matrix.expectation }}
+        WINEARCH: ${{ matrix.wine_arch }}
+      run: |-
+        set -x
+        timeout 60s wineboot --init
+        wineserver --wait
+
+        set +e
+        timeout 60s wine controls/asan-ok.exe > controls/ok.log 2>&1
+        ok_exit_code=$?
+        wineserver --wait
+        timeout 60s wine controls/asan-bad.exe > controls/bad.log 2>&1
+        bad_exit_code=$?
+        wineserver --wait
+        set -e
+
+        printf 'healthy exit code: %d\nfailing exit code: %d\n' \
+            "${ok_exit_code}" "${bad_exit_code}"
+        sed -n '1,120p' controls/ok.log
+        sed -n '1,160p' controls/bad.log
+
+        if [[ "${EXPECTATION}" == sanitizer ]]; then
+          test "${ok_exit_code}" -eq 0
+          test "${bad_exit_code}" -ne 0
+          if grep -Fq 'Shadow memory range interleaves' controls/ok.log; then
+            false
+          fi
+          grep -Fq 'ERROR: AddressSanitizer: heap-buffer-overflow' controls/bad.log
+        else
+          test "${ok_exit_code}" -ne 0
+          test "${bad_exit_code}" -ne 0
+          grep -Fq 'Shadow memory range interleaves' controls/ok.log
+          grep -Fq 'ASan shadow was supposed to be located in the [0x2fff0000-0x3fffffff] range' \
+              controls/ok.log
+        fi
